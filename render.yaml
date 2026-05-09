@@ -1,0 +1,40 @@
+services:
+  - type: web
+    name: fib-continuation-v1
+    runtime: python
+    region: oregon
+    plan: starter
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 server.py
+    healthCheckPath: /health
+    autoDeploy: true
+    disk:
+      name: fibcont-state
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: HL_WALLET
+        value: "0x3eDaD0649Db466E6E7B9a0Caa3E5d6ddc71B5ffE"
+      - key: PM_URL
+        value: "https://portfolio-manager-7df2.onrender.com"
+      - key: PM_CHECK_ENABLED
+        value: "0"            # PM Phase 2 not built yet
+      - key: LIVE_TRADING
+        value: "0"            # PAPER mode
+      - key: DRY_RUN
+        value: "0"
+      - key: SCAN_INTERVAL_SEC
+        value: "300"          # 5 min between scans
+      - key: POSITION_CHECK_INTERVAL_SEC
+        value: "60"
+      - key: RISK_PCT_PER_TRADE
+        value: "0.01"         # 1% risk per trade
+      - key: LEVERAGE
+        value: "5"
+      - key: MAX_NOTIONAL_PER_TRADE
+        value: "100"
+      - key: MAX_OPEN_POSITIONS
+        value: "4"
+      - key: STATE_DIR
+        value: "/var/data"
