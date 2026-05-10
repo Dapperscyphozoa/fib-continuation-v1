@@ -66,6 +66,12 @@ SQUEEZE_PARAMS = FIB_PARAMS
 RISK_PCT_PER_TRADE = float(os.environ.get("RISK_PCT_PER_TRADE", "0.01"))
 LEVERAGE = int(os.environ.get("LEVERAGE", "5"))
 MAX_NOTIONAL_PER_TRADE = float(os.environ.get("MAX_NOTIONAL_PER_TRADE", "100"))
+
+# Fixed-notional override. When > 0, position_size() ignores risk-based
+# computation entirely and returns exactly this dollar notional per trade.
+# Set via Render env. Default 0 = disabled (use risk-based sizing).
+FIXED_NOTIONAL_USD = float(os.environ.get("FIXED_NOTIONAL_USD", "0"))
+
 MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "4"))
 
 SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", "300"))

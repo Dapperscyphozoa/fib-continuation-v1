@@ -18,6 +18,7 @@ from . import persistence
 from . import pm_client
 from .config import (
     PAPER_MODE, LIVE_TRADING, DRY_RUN, USE_TESTNET, CLOID_PREFIX,
+    FIXED_NOTIONAL_USD,
     LEVERAGE, MAX_NOTIONAL_PER_TRADE, MAX_OPEN_POSITIONS, RISK_PCT_PER_TRADE,
     HALT_STATE, ACTIVE_UNIVERSE, BLOCKED_UNIVERSE,
     TRADE_PARAMS,
@@ -83,6 +84,14 @@ def position_size(equity: float, ref_price: float, sl_distance_pct: float,
     """Compute (size_in_coin, notional_usd)."""
     if ref_price <= 0 or sl_distance_pct <= 0:
         return (0, 0)
+    # Fixed-notional override (env: FIXED_NOTIONAL_USD). Bypasses risk-based
+    # sizing — every trade is exactly this dollar notional. Capped only by
+    # available leverage on the account.
+    if FIXED_NOTIONAL_USD > 0:
+        notional_cap_lev = equity * LEVERAGE
+        notional = min(FIXED_NOTIONAL_USD * scale, notional_cap_lev)
+        size = notional / ref_price
+        return (size, notional)
     risk_usd = equity * RISK_PCT_PER_TRADE * scale
     notional_target = risk_usd / sl_distance_pct
     notional_cap_lev = equity * LEVERAGE
