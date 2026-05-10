@@ -107,7 +107,14 @@ def _scan_once():
 
 
 def position_loop():
-    """Every POSITION_CHECK_INTERVAL_SEC: check open trades for exits."""
+    """Every POSITION_CHECK_INTERVAL_SEC: check open trades for exits.
+
+    Lookahead-safe paper resolution: for each coin with open trades, fetch
+    enough recent bars to cover the oldest trade's lifetime + buffer, then
+    pass the bar list to manage_open_trades. The resolver scans only bars
+    whose start_ms >= ts_open, eliminating the bug where a fresh trade
+    inherits the current bar's pre-entry high/low and instantly TPs.
+    """
     print(f"[positions] loop starting (interval={POSITION_CHECK_INTERVAL_SEC}s)", flush=True)
     time.sleep(20)
 
@@ -118,18 +125,43 @@ def position_loop():
                 time.sleep(POSITION_CHECK_INTERVAL_SEC)
                 continue
 
-            # Build a price cache to avoid hitting HL once per coin per loop
-            unique_coins = list({t["coin"] for t in open_trades})
+            # Per-coin oldest trade ts_open → bars to fetch
+            now_ms = int(time.time() * 1000)
+            coin_oldest = {}
+            for t in open_trades:
+                c = t["coin"]; ts = t.get("ts_open", now_ms)
+                coin_oldest[c] = min(coin_oldest.get(c, ts), ts)
+
             price_cache = {}
-            for coin in unique_coins:
-                df = hl_data.fetch_candles(coin, interval="1h", n_bars=2)
-                if df is not None and len(df) > 0:
-                    last_bar = df.iloc[-1]
-                    price_cache[coin] = (
-                        float(last_bar["close"]),
-                        float(last_bar["high"]),
-                        float(last_bar["low"]),
-                    )
+            for coin, oldest_ts in coin_oldest.items():
+                # 1h bars; cover (now - oldest) hours + 2 buffer, capped at 48
+                age_h = max(1, int((now_ms - oldest_ts) / 3_600_000) + 2)
+                n_bars = min(48, age_h + 1)
+                df = hl_data.fetch_candles(coin, interval="1h", n_bars=n_bars)
+                if df is None or len(df) == 0:
+                    continue
+                last_bar = df.iloc[-1]
+                bars = []
+                for ts_val, row in df.iterrows():
+                    # ts is the DataFrame index — pandas Timestamp (UTC).
+                    # Convert to int ms.
+                    try:
+                        bar_ts = int(ts_val.timestamp() * 1000)
+                    except Exception:
+                        bar_ts = None
+                    bars.append({
+                        "t": bar_ts,
+                        "o": float(row["open"]) if "open" in df.columns else None,
+                        "h": float(row["high"]),
+                        "l": float(row["low"]),
+                        "c": float(row["close"]),
+                    })
+                price_cache[coin] = (
+                    float(last_bar["close"]),
+                    float(last_bar["high"]),
+                    float(last_bar["low"]),
+                    bars,
+                )
 
             def get_price(coin):
                 return price_cache.get(coin)

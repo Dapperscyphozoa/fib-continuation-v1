@@ -14,6 +14,8 @@ import uuid
 import threading
 from typing import Optional
 
+from . import blacklist  # consecutive-loss tracker + dynamic blacklist
+
 from . import persistence
 from . import pm_client
 from .config import (
@@ -108,8 +110,9 @@ def attempt_trade(coin: str, signal: dict) -> dict:
 
     if coin in BLOCKED_UNIVERSE:
         return {"status": "skipped", "reason": "blocked_universe"}
-    if coin not in ACTIVE_UNIVERSE:
-        return {"status": "skipped", "reason": "not_in_active_universe"}
+    # NB: ACTIVE_UNIVERSE check removed — scan loop already filters via
+    # _get_active_universe() (dynamic full HL universe minus blacklist + BLOCKED).
+    # The static config ACTIVE_UNIVERSE is now stale when USE_FULL_UNIVERSE=1.
 
     open_trades = persistence.get_open_trades()
     pending_trades = persistence.get_pending_live_trades()
@@ -340,7 +343,19 @@ def reconcile_live_pending():
 
 
 def manage_open_trades(get_current_price_fn, get_current_atr_fn=None):
-    """Iterate open trades, check for SL/TP/time-stop hits, close them."""
+    """Iterate open trades, check for SL/TP/time-stop hits, close them.
+
+    get_current_price_fn(coin) signature has TWO supported shapes:
+      (a) returns (last_px, hi, lo)            — legacy 1-bar tuple
+      (b) returns (last_px, hi, lo, bars)      — bars is list of dict with
+          keys 't' (start_ms), 'o','h','l','c'. Used for lookahead-safe
+          paper resolution: only bars with t >= ts_open are scanned for hits.
+
+    Lookahead bug fix: shape (a) consumes the CURRENT bar's cumulative
+    high/low which includes price action BEFORE the trade entered. That
+    inflates paper TP/SL hits artificially. Shape (b) lets the resolver
+    scan only post-entry bar history.
+    """
     open_trades = persistence.get_open_trades()
     closed = []
 
@@ -362,18 +377,47 @@ def manage_open_trades(get_current_price_fn, get_current_atr_fn=None):
             continue
         if current is None:
             continue
-        last_px, hi, lo = current
+        # Support both legacy 3-tuple and new 4-tuple (with post-entry bars)
+        bars = None
+        if len(current) >= 4:
+            last_px, hi, lo, bars = current[0], current[1], current[2], current[3]
+        else:
+            last_px, hi, lo = current
 
         outcome = None
         exit_px = None
         is_long = side == "B"
 
-        if is_long:
-            if lo <= sl_px: outcome, exit_px = "SL", sl_px
-            elif hi >= tp_px: outcome, exit_px = "TP", tp_px
+        # If we have bar history, scan only bars whose start_ms >= ts_open.
+        # SL-first on same-bar SL+TP hits (conservative — matches live spec).
+        if bars:
+            for bar in bars:
+                bar_ts = bar.get("t") or bar.get("ts")
+                if bar_ts is None or bar_ts < ts_open:
+                    continue
+                bh = float(bar.get("h", bar.get("high", 0)))
+                bl = float(bar.get("l", bar.get("low", 0)))
+                if bh <= 0 or bl <= 0:
+                    continue
+                if is_long:
+                    if bl <= sl_px:
+                        outcome, exit_px = "SL", sl_px; break
+                    if bh >= tp_px:
+                        outcome, exit_px = "TP", tp_px; break
+                else:
+                    if bh >= sl_px:
+                        outcome, exit_px = "SL", sl_px; break
+                    if bl <= tp_px:
+                        outcome, exit_px = "TP", tp_px; break
         else:
-            if hi >= sl_px: outcome, exit_px = "SL", sl_px
-            elif lo <= tp_px: outcome, exit_px = "TP", tp_px
+            # Legacy path — kept for back-compat. Live mode fills here too,
+            # but paper mode should always pass bars going forward.
+            if is_long:
+                if lo <= sl_px: outcome, exit_px = "SL", sl_px
+                elif hi >= tp_px: outcome, exit_px = "TP", tp_px
+            else:
+                if hi >= sl_px: outcome, exit_px = "SL", sl_px
+                elif lo <= tp_px: outcome, exit_px = "TP", tp_px
 
         if outcome is None:
             now_ms = int(time.time() * 1000)
@@ -409,6 +453,11 @@ def manage_open_trades(get_current_price_fn, get_current_atr_fn=None):
                 live_exit_oid=result.get("oid"),
                 live_exit_cloid=result.get("exchange_cloid"),
             )
+            # Update consecutive-loss tracker for this coin
+            try:
+                blacklist.record_outcome(coin, gross_pnl - fees, outcome=outcome)
+            except Exception as _e:
+                print(f"[trader] blacklist hook failed (live): {_e}", flush=True)
             closed.append({"cloid": cloid, "coin": coin, "outcome": outcome,
                            "entry_px": entry_px, "exit_px": actual_exit_px,
                            "gross_pnl": gross_pnl, "net_pnl": gross_pnl - fees,
@@ -425,6 +474,11 @@ def manage_open_trades(get_current_price_fn, get_current_atr_fn=None):
                 gross_pnl=gross_pnl, fees=fees, bars_held=bars_held,
                 ref_notional=notional,
             )
+            # Update consecutive-loss tracker for this coin
+            try:
+                blacklist.record_outcome(coin, gross_pnl - fees, outcome=outcome)
+            except Exception as _e:
+                print(f"[trader] blacklist hook failed (paper): {_e}", flush=True)
             closed.append({"cloid": cloid, "coin": coin, "outcome": outcome,
                            "entry_px": entry_px, "exit_px": exit_px,
                            "gross_pnl": gross_pnl, "net_pnl": gross_pnl - fees,
