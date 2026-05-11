@@ -1,9 +1,18 @@
 """
 Hyperliquid public market data fetcher.
 Fetches 1h OHLCV candles for the active universe.
+
+429 hardening (2026-05-11):
+  - Per-engine rate limiter (token bucket via min-interval lock)
+  - 429-specific exponential backoff with jitter
+  - Honor Retry-After header
+  - Distinct log line for 429 vs other failures
 """
 from __future__ import annotations
 import json
+import os
+import random
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -13,9 +22,28 @@ import pandas as pd
 from .config import HL_REST
 
 
-def _post(payload: dict, retries: int = 3, timeout: int = 15) -> Optional[list]:
+# ─────────────────────────────────────────────────────────────────────────
+# Per-engine HTTP throttle. Configurable via HL_MIN_INTERVAL_MS env.
+# Default 250ms = max 4 calls/sec from this engine. Combined with the
+# other v-engines this gives HL's per-IP budget headroom.
+# ─────────────────────────────────────────────────────────────────────────
+_MIN_INTERVAL_S = max(0.05, float(os.environ.get("HL_MIN_INTERVAL_MS", "250")) / 1000.0)
+_rate_lock = threading.Lock()
+_last_call_t = [0.0]
+
+
+def _throttle() -> None:
+    with _rate_lock:
+        dt = time.monotonic() - _last_call_t[0]
+        if dt < _MIN_INTERVAL_S:
+            time.sleep(_MIN_INTERVAL_S - dt)
+        _last_call_t[0] = time.monotonic()
+
+
+def _post(payload: dict, retries: int = 5, timeout: int = 15) -> Optional[list]:
     body = json.dumps(payload).encode()
     for i in range(retries):
+        _throttle()
         try:
             req = urllib.request.Request(
                 HL_REST, data=body,
@@ -24,17 +52,37 @@ def _post(payload: dict, retries: int = 3, timeout: int = 15) -> Optional[list]:
             )
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return json.loads(r.read().decode())
-        except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError, TimeoutError) as e:
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                wait_s = 0.0
+                ra = e.headers.get("Retry-After", "") if e.headers else ""
+                try:
+                    if ra:
+                        wait_s = float(ra)
+                except ValueError:
+                    wait_s = 0.0
+                if wait_s <= 0:
+                    wait_s = min(60.0, (2 ** (i + 2)) + random.uniform(0.0, 3.0))
+                if i == retries - 1:
+                    print(f"[hl_data] POST 429 after {retries} retries (last wait {wait_s:.1f}s)", flush=True)
+                    return None
+                time.sleep(wait_s)
+            else:
+                if i == retries - 1:
+                    print(f"[hl_data] POST failed after {retries}: HTTP {e.code} {e.reason}", flush=True)
+                    return None
+                time.sleep(min(10.0, 2 ** i) + random.uniform(0.0, 1.0))
+        except (urllib.error.URLError, json.JSONDecodeError, TimeoutError) as e:
             if i == retries - 1:
                 print(f"[hl_data] POST failed after {retries}: {e}", flush=True)
                 return None
-            time.sleep(min(10, 2 ** i))
+            time.sleep(min(10.0, 2 ** i) + random.uniform(0.0, 1.0))
     return None
 
 
 def fetch_candles(coin: str, interval: str = "1h", n_bars: int = 200) -> Optional[pd.DataFrame]:
     """
-    Fetch last `n_bars` 1h candles for `coin` from HL.
+    Fetch last `n_bars` candles for `coin` from HL.
     Returns DataFrame with [open, high, low, close, volume] indexed by timestamp.
     """
     end_ms = int(time.time() * 1000)
