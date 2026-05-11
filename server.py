@@ -352,6 +352,28 @@ class Handler(BaseHTTPRequestHandler):
                 # Manual trigger
                 threading.Thread(target=_scan_once, daemon=True).start()
                 _json(self, 200, {"status": "scan_triggered"})
+            elif u.path == "/wipe_all_open":
+                # Reconciliation: mark ALL open trades (paper + live) as wiped.
+                # Used when wallet has 0 open positions but DB tracks phantoms.
+                if HALT_TOKEN:
+                    provided = self.headers.get("X-Halt-Token", "").strip()
+                    import hmac as _hmac
+                    if not provided or not _hmac.compare_digest(provided, HALT_TOKEN):
+                        _json(self, 401, {"error": "unauthorized"})
+                        return
+                wiped = 0
+                try:
+                    with persistence.conn() as c:
+                        rows = c.execute("SELECT cloid FROM trades WHERE status='open'").fetchall()
+                        for r in rows:
+                            c.execute("UPDATE trades SET status='wiped_phantom' WHERE cloid=?", (r[0],))
+                            wiped += 1
+                        c.commit()
+                    _json(self, 200, {"wiped": wiped})
+                    print(f"[wipe_all_open] wiped={wiped} phantom open trades", flush=True)
+                except Exception as e:
+                    _json(self, 500, {"error": str(e)})
+
             else:
                 _json(self, 404, {"error": "not_found"})
         except Exception as e:
